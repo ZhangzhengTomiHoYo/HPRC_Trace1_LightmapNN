@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2000)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--dataset", type=str, default='../Data/Data_HPRC')
+    parser.add_argument("--dataset", type=str, default='G:/Tencent_HPRC/HPRC_Test1/trunk/Data/Data_HPRC')
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"using device: {device}")
