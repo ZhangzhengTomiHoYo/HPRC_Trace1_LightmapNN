@@ -2,19 +2,64 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 import argparse
 import os
 import OpenEXR
 import json
+import time
+import logging
+from datetime import datetime  # 用于获取当前小时分钟生成日志文件名
 
 from ExampleModel import ExampleModel
 import Utils
+
+# ===================== 日志配置 =====================
+def setup_logger():
+    """配置日志：文件名为train-小时分钟-日-月-年.log，同时输出到控制台和文件"""
+    # 获取当前时间的小时和分钟（例如：14点35分 → 1435）
+    current_time = datetime.now()
+    # 核心改动：新增日、月、年的格式符，文件名规则变为 train-小时分钟-日-月-年.log
+    # %H=小时(24制)、%M=分钟、%d=日、%m=月、%Y=4位年份
+    log_filename = f"train-{current_time.strftime('%H%M-%d-%m-%Y')}.log"
+    
+    # 日志格式：时间 + 级别 + 消息
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+    
+    # 配置根日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        datefmt=date_format,
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),  # 写入文件
+            logging.StreamHandler()  # 输出到控制台（可选，如需仅文件输出可删除此行）
+        ]
+    )
+    return logging.getLogger(__name__)
+
+# 初始化日志器
+logger = setup_logger()
+
+# ===================== 时间格式化工具 =====================
+def format_time(seconds):
+    """将秒数格式化为 小时h 分钟m 秒.xxs"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours}h {minutes}m {secs:.2f}s"
 
 def parse_times(time_str):
     return int(time_str) / 100.0
 
 def main():
+    # 记录程序总开始时间（总训练时间起点）
+    total_start_time = time.time()
+    logger.info("="*50)
+    logger.info("程序启动，开始统计总训练时间")
+    logger.info(f"使用设备: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+    logger.info("="*50)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=2000)
@@ -23,7 +68,6 @@ def main():
     parser.add_argument("--dataset", type=str, default='G:/Tencent_HPRC/HPRC_Test1/trunk/Data/Data_HPRC')
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"using device: {device}")
 
     # 创建保存参数和结果的文件夹
     os.makedirs(f"./Parameters", exist_ok=True)
@@ -41,18 +85,24 @@ def main():
     total_ssim = []
     total_lpips = []
 
-    # 分别训练每张lightmap
-    for lightmap in config['lightmap_list']:
-        print(f"training lightmap {lightmap['level']}_{lightmap['id']}")
+    # 统计每个光照贴图的耗时（存储字典：key=lightmap_id, value=总耗时/训练耗时）
+    lightmap_time_stats = {}
 
-        # 从配置文件中获取lightmap的id、lightmap路径、mask路径、分辨率
+    # 分别训练每张lightmap
+    for idx, lightmap in enumerate(config['lightmap_list']):
+        lightmap_id = f"{lightmap['level']}_{lightmap['id']}"
+        logger.info(f"\n{'='*20} 开始处理光照贴图: {lightmap_id} (第{idx+1}/{len(config['lightmap_list'])}) {'='*20}")
+        
+        # 记录当前光照贴图的总处理开始时间（数据准备+训练+测试）
+        lightmap_total_start = time.time()
+
+        # 从配置文件中获取lightmap的基础信息
         id = lightmap['id']
         lightmap_names = lightmap['lightmaps']
         mask_names = lightmap['masks']
         resolution = lightmap['resolution']
 
         # 读取每张lightmap在不同时间的数据
-        # 关于读取数据，你可以参照ReadData.py来获取更详细的信息
         lightmap_in_different_time = []
         for time_idx in range(time_count):
             lightmap_path = os.path.join(args.dataset, "Data", lightmap_names[times[time_idx % (time_count - 1)]])
@@ -83,13 +133,16 @@ def main():
                 current_time = times[time_idx]
             else:
                 current_time = "2400"
-            print(f"parse_times(current_time): {parse_times(current_time)}")
+            # print(f"parse_times(current_time): {parse_times(current_time)}")
             alpha = torch.full((resolution['width'] * resolution['height'], 1), (parse_times(current_time) / 24)).to(device)
             coords_with_time = torch.cat([coords, alpha], dim=-1)
             total_coords.append(coords_with_time)
         total_coords = torch.cat(total_coords, dim=0)
         total_data = torch.cat([total_coords, lightmap_data], dim=-1)
-        total_data =total_data[torch.randperm(total_data.shape[0])]
+        total_data = total_data[torch.randperm(total_data.shape[0])]
+        
+        # 记录训练循环开始时间（纯训练耗时起点）
+        train_loop_start = time.time()
         
         # 训练循环
         batch_start = 0
@@ -109,11 +162,14 @@ def main():
                 total_data = total_data[torch.randperm(total_data.shape[0])]
 
             if (it + 1) % 1000 == 0:
-                print(f"iteration {it + 1} loss: {loss.item()}")
+                logger.info(f"光照贴图 {lightmap_id} - 迭代 {it + 1} | 损失: {loss.item():.6f}")
 
-        # 保存实际模型参数为二进制文件
-        # 文件大小就是模型实际的大小，也是计算压缩率的依据
-        # 请不要进行任何压缩
+        # 计算当前光照贴图的纯训练耗时
+        train_loop_duration = time.time() - train_loop_start
+        # 计算当前光照贴图的总处理耗时（数据准备+训练+测试）
+        lightmap_total_duration = time.time() - lightmap_total_start
+
+        # 保存模型参数
         all_params = []
         for param in model.parameters():
             all_params.append(param.detach().cpu().numpy().flatten())
@@ -137,7 +193,7 @@ def main():
             # 将lightmap数据reshape为[time_count, height, width, 3]方便计算指标
             lightmap_data = lightmap_data.reshape(time_count, resolution['height'], resolution['width'], 3).permute(0, 3, 1, 2)
             
-            # 初始化该lightmap的指标list
+            # 计算指标
             psnr_list = []
             ssim_list = []
             lpips_list = []
@@ -167,19 +223,24 @@ def main():
                             ssim_list.append(Utils.cal_ssim(lightmap_part, lightmap_reconstruct_part))
                             lpips_list.append(Utils.cal_lpips(lightmap_part, lightmap_reconstruct_part))
 
-            # 将该lightmap的指标list添加到整个数据集的指标list中
+            # 汇总指标
             total_psnr.extend(psnr_list)
             total_ssim.extend(ssim_list)
             total_lpips.extend(lpips_list)
             
-            # 打印该lightmap的指标
-            print(f"metrics of lightmap {lightmap['level']}_{id}------------")
-            print(f"PSNR: {np.mean(psnr_list)}")
-            print(f"SSIM: {np.mean(ssim_list)}")
-            print(f"LPIPS: {np.mean(lpips_list)}")
-            print(f"Model Size: {sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024:.2f} MB")
-            print(f"Data Size: {lightmap_data.shape[0] * lightmap_data.shape[1] * lightmap_data.shape[2] * lightmap_data.shape[3] * 4 / 1024 / 1024:.2f} MB")
-            print("-----------------------------------------")
+            # ===================== 记录当前光照贴图的时间统计 =====================
+            lightmap_time_stats[lightmap_id] = {
+                "纯训练耗时": format_time(train_loop_duration),
+                "总处理耗时(数据+训练+测试)": format_time(lightmap_total_duration),
+                "迭代次数": args.iterations,
+                "批次大小": args.batch_size
+            }
+            logger.info(f"\n{'='*20} 光照贴图 {lightmap_id} 时间统计 {'='*20}")
+            logger.info(f"纯训练耗时: {lightmap_time_stats[lightmap_id]['纯训练耗时']}")
+            logger.info(f"总处理耗时: {lightmap_time_stats[lightmap_id]['总处理耗时(数据+训练+测试)']}")
+            logger.info(f"PSNR: {np.mean(psnr_list):.2f} | SSIM: {np.mean(ssim_list):.4f} | LPIPS: {np.mean(lpips_list):.4f}")
+            logger.info(f"模型大小: {sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024:.2f} MB")
+            logger.info(f"数据大小: {lightmap_data.shape[0] * lightmap_data.shape[1] * lightmap_data.shape[2] * lightmap_data.shape[3] * 4 / 1024 / 1024:.2f} MB")
 
             # 保存拟合结果为exr文件
             pred = pred.detach().cpu().numpy().transpose(0, 2, 3, 1)
@@ -193,13 +254,22 @@ def main():
                     for i, c in enumerate(channels)
                 })
                 exr.close()
+        # break  # 测试用，如需训练所有lightmap请删除此行
             
-    # 打印整个数据集的指标
-    print(f"metrics of total data set ---------------")        
-    print(f"PSNR of all lightmaps: {np.mean(total_psnr)}")
-    print(f"SSIM of all lightmaps: {np.mean(total_ssim)}")
-    print(f"LPIPS of all lightmaps: {np.mean(total_lpips)}")
-    print("-----------------------------------------")
-    
+    # ===================== 总训练时间统计 =====================
+    total_duration = time.time() - total_start_time
+    logger.info(f"\n{'='*30} 全局时间统计 {'='*30}")
+    logger.info(f"程序总运行时间（总训练时间）: {format_time(total_duration)}")
+    logger.info(f"\n各光照贴图耗时明细:")
+    for lm_id, stats in lightmap_time_stats.items():
+        logger.info(f"贴图id: {lm_id}:")
+        logger.info(f"纯训练耗时: {stats['纯训练耗时']}")
+        # logger.info(f"    - 总处理耗时: {stats['总处理耗时(数据+训练+测试)']}")
+    logger.info(f"\n全局指标:")
+    logger.info(f"PSNR (所有光照贴图): {np.mean(total_psnr):.2f}")
+    logger.info(f"SSIM (所有光照贴图): {np.mean(total_ssim):.4f}")
+    logger.info(f"LPIPS (所有光照贴图): {np.mean(total_lpips):.4f}")
+    # logger.info("="*60)
+
 if __name__ == "__main__":
     main()
